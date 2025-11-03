@@ -1,0 +1,502 @@
+import cv2
+import numpy as np
+import os
+import glob
+from PIL import Image, ImageEnhance
+import random
+
+"""
+Adds vertical occlusion bars to person images
+
+    Workflow:
+    1: Initialize directories for augmented images and annotations
+    2: Load and convert seg points from annotation to seg mask for occlusion
+    3: Create a occluation bar with jagged edges, darkness filter, and different colours for better training results
+    4: Update the annotation by removing the now hidden seg points and adding points for the jagged edges (we also horizontally flip the image)
+    5: Save the augmented images and annotations in the new directories
+"""
+
+class PersonOcclusionAugmentor:
+    def __init__(self, img_dir, ann_dir, output_img_dir, output_ann_dir):
+        """
+        Initialize with dir paths
+        
+        Args:
+            img_dir: Directory containing original images
+            ann_dir: Directory containing annotation files (YOLO format)
+            output_img_dir: Directory to save augmented images
+            output_ann_dir: Directory to save updated annotations
+        """
+        self.img_dir = img_dir
+        self.ann_dir = ann_dir
+        self.output_img_dir = output_img_dir
+        self.output_ann_dir = output_ann_dir
+        
+        # Create output directories if they don't exist
+        os.makedirs(output_img_dir, exist_ok=True)
+        os.makedirs(output_ann_dir, exist_ok=True)
+    
+    # ==================
+    # Loading and saving
+    # ==================
+    
+    def load_annotations(self, label_file):
+        """
+        Load and parse YOLO format annotation file
+        
+        Args:
+            label_file: Path to the annotation file
+            
+        Returns:
+            List of annotation dictionaries with class_id, bbox, and segmentation points
+        """
+        with open(label_file, 'r') as f:
+            lines = f.readlines()
+        
+        annotations = []
+        for line in lines:
+            # Convert line to float values
+            parts = list(map(float, line.strip().split()))
+            if len(parts) < 5:
+                continue  # Skip invalid lines
+                
+            class_id = int(parts[0])
+            bbox = parts[1:5]  # [center_x, center_y, width, height] in normalized coordinates
+            seg_points = parts[5:]  # Segmentation points in normalized coordinates
+            
+            annotations.append({
+                'class_id': class_id,
+                'bbox': bbox,
+                'seg_points': seg_points
+            })
+        
+        return annotations
+    
+    def save_annotations(self, annotations, output_file):
+        """
+        Save updated annotations back to YOLO format file
+        
+        Args:
+            annotations: List of annotation dictionaries
+            output_file: Path where to save the annotations
+        """
+        with open(output_file, 'w') as f:
+            for ann in annotations:
+                # Format: class_id bbox_coords segmentation_points
+                line = f"{ann['class_id']} " + \
+                       " ".join(f"{x:.6f}" for x in ann['bbox']) + " " + \
+                       " ".join(f"{x:.6f}" for x in ann['seg_points'])
+                f.write(line + "\n")
+    
+    # =============================
+    # Seg mask and point conversion
+    # =============================
+
+    def create_segmentation_mask(self, seg_points, img_width, img_height):
+        """
+        Convert segmentation points to a binary mask
+        
+        Args:
+            seg_points: List of normalized segmentation points [x1, y1, x2, y2, ...]
+            img_width: Width of the image
+            img_height: Height of the image
+            
+        Returns:
+            Binary mask where the segmentation area is white (255) and background is black (0)
+        """
+        mask = np.zeros((img_height, img_width), dtype=np.uint8)
+        points = []
+        
+        # Convert normalized coordinates to pixel coordinates
+        for i in range(0, len(seg_points), 2):
+            x = int(seg_points[i] * img_width)
+            y = int(seg_points[i+1] * img_height)
+            points.append([x, y])
+        
+        # Create polygon mask if we have at least 3 points (triangle)
+        if len(points) >= 3:
+            pts = np.array(points, dtype=np.int32)
+            cv2.fillPoly(mask, [pts], 255)  # Fill polygon with white
+        
+        return mask
+    
+    def mask_to_polygon(self, mask, epsilon_factor=0.005):
+        """
+        Convert binary mask back to polygon points
+        
+        Args:
+            mask: Binary mask image
+            epsilon_factor: Factor for polygon approximation (not used in current implementation)
+            
+        Returns:
+            List of normalized polygon points [x1, y1, x2, y2, ...]
+        """
+        # Find contours in the mask
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            return []  # Return empty if no contours found
+        
+        # Get the largest contour (main object)
+        contour = max(contours, key=cv2.contourArea)
+        polygon_points = []
+        h, w = mask.shape
+        
+        # Convert contour points back to normalized coordinates
+        for point in contour:
+            x = point[0][0] / w
+            y = point[0][1] / h
+            polygon_points.extend([x, y])
+        
+        return polygon_points
+    
+    def get_bbox_from_segmentation(self, seg_points, img_width, img_height):
+        """
+        Calculate bounding box from segmentation points
+        
+        Args:
+            seg_points: List of normalized segmentation points
+            img_width: Image width (not used but kept for interface consistency)
+            img_height: Image height (not used but kept for interface consistency)
+            
+        Returns:
+            Bounding box in YOLO format [center_x, center_y, width, height] in normalized coordinates
+        """
+        if len(seg_points) < 4:
+            return None
+        
+        # Extract x and y coordinates separately
+        xs = [seg_points[i] for i in range(0, len(seg_points), 2)]
+        ys = [seg_points[i+1] for i in range(0, len(seg_points), 2)]
+        
+        # Calculate bounding box boundaries
+        x_min = max(0.0, min(xs))
+        y_min = max(0.0, min(ys))
+        x_max = min(1.0, max(xs))
+        y_max = min(1.0, max(ys))
+        
+        # Convert to YOLO format (center coordinates and dimensions)
+        width = x_max - x_min
+        height = y_max - y_min
+        center_x = x_min + width / 2
+        center_y = y_min + height / 2
+        
+        return [center_x, center_y, width, height]
+    
+    # ======================
+    # Occlusion bar creation
+    # ======================
+    
+    def get_average_colour_around_bbox(self, image, bbox_coords, margin=10):
+        """
+        Calculate average color in the region around bounding box
+        
+        Args:
+            image: Input image
+            bbox_coords: Bounding box coordinates in pixels (x1, y1, x2, y2)
+            margin: Additional margin around bbox to sample color from
+            
+        Returns:
+            Average BGR color as list [b, g, r]
+        """
+        x1, y1, x2, y2 = bbox_coords
+        h, w = image.shape[:2]
+        
+        # Expand bounding box by margin for color sampling
+        sample_x1 = max(0, x1 - margin)
+        sample_y1 = max(0, y1 - margin)
+        sample_x2 = min(w, x2 + margin)
+        sample_y2 = min(h, y2 + margin)
+        
+        # Extract region of interest
+        roi = image[sample_y1:sample_y2, sample_x1:sample_x2]
+        if roi.size == 0:
+            return [0, 0, 0]  # Return black if ROI is empty
+        
+        # Calculate mean color across the ROI
+        avg_colour = np.mean(roi, axis=(0, 1))
+        return avg_colour.astype(np.uint8)
+
+    def create_jagged_line(self, y_start, y_end, x_base, img_width, max_jaggedness=0.01):
+        """
+        Create a jagged vertical line for natural-looking occlusion edges
+        
+        Args:
+            y_start: Starting y-coordinate
+            y_end: Ending y-coordinate  
+            x_base: Base x-coordinate for the line
+            img_width: Image width for calculating jitter range
+            max_jaggedness: Maximum jitter as fraction of image width
+            
+        Returns:
+            List of (x, y) points defining the jagged line
+        """
+        num_segments = random.randint(5, 15)  # Random number of segments for variability
+        segment_height = (y_end - y_start) / num_segments
+        points = []
+        
+        # Create points with random x-jitter
+        for i in range(num_segments + 1):
+            y = y_start + i * segment_height
+            max_jitter = int(img_width * max_jaggedness)
+            x_jitter = random.randint(-max_jitter, max_jitter)  # Random horizontal variation
+            x = x_base + x_jitter
+            points.append((x, int(y)))
+        
+        return points
+
+    def add_vertical_occlusion(self, image, annotations):
+        """
+        Add vertical occlusion bars to person instances in the image
+        
+        Args:
+            image: Input image
+            annotations: List of annotations for the image
+            
+        Returns:
+            Augmented image and updated annotations
+        """
+        h, w = image.shape[:2]
+        augmented_image = image.copy()
+        updated_annotations = []
+        
+        for ann in annotations:
+            # Only process person class (class_id 0 in COCO format)
+            if ann['class_id'] != 0:
+                updated_annotations.append(ann)
+                continue
+            
+            # Create segmentation mask for the current person
+            original_mask = self.create_segmentation_mask(ann['seg_points'], w, h)
+            
+            # Convert normalized bbox to pixel coordinates
+            cx, cy, bw, bh = ann['bbox']
+            x1 = int((cx - bw/2) * w)
+            y1 = int((cy - bh/2) * h)
+            x2 = int((cx + bw/2) * w)
+            y2 = int((cy + bh/2) * h)
+            
+            # Randomly choose which side to occlude
+            side = random.choice(["left", "right"])
+            
+            # Calculate occlusion width (40-60% of person width)
+            max_occlusion_width = int((x2 - x1) * 0.6)
+            occlusion_width = random.randint(int(max_occlusion_width * 0.4), max_occlusion_width)
+            
+            # Create occlusion mask
+            occlusion_mask = np.zeros((h, w), dtype=np.uint8)
+            
+            if side == "left":
+                # Create occlusion bar on left side with jagged right edge
+                bar_x_base = x1 + occlusion_width
+                jagged_points = self.create_jagged_line(0, h, bar_x_base, w)
+                polygon_points = [[x1, 0]] + jagged_points + [[x1, h]]
+            else:
+                # Create occlusion bar on right side with jagged left edge  
+                bar_x_base = x2 - occlusion_width
+                jagged_points = self.create_jagged_line(0, h, bar_x_base, w)
+                polygon_points = [[x2, 0]] + jagged_points + [[x2, h]]
+            
+            # Create polygon for occlusion bar
+            polygon_points = np.array(polygon_points, dtype=np.int32)
+            cv2.fillPoly(occlusion_mask, [polygon_points], 255)
+            
+            # Get average color from around the person for natural-looking occlusion
+            avg_colour = self.get_average_colour_around_bbox(image, (x1, y1, x2, y2))
+            
+            # Apply occlusion bar to image
+            overlay = image.copy()
+            bar_coords = np.where(occlusion_mask == 255)
+            overlay[bar_coords[0], bar_coords[1]] = avg_colour
+            cv2.addWeighted(overlay, 0.7, augmented_image, 0.0, 0, augmented_image)
+            
+            # Update segmentation mask by removing occluded area
+            remaining_mask = original_mask.copy()
+            remaining_mask[occlusion_mask == 255] = 0
+            
+            # Convert updated mask back to polygon points
+            new_seg_points = self.mask_to_polygon(remaining_mask)
+            
+            if len(new_seg_points) >= 6:  # Need at least 3 points (6 coordinates)
+                # Update bounding box based on new segmentation
+                new_bbox = self.get_bbox_from_segmentation(new_seg_points, w, h)
+                ann['bbox'] = new_bbox
+                ann['seg_points'] = new_seg_points
+                updated_annotations.append(ann)
+        
+        return augmented_image, updated_annotations
+
+    def apply_dark_filter(self, image, darkness_factor=0.7):
+        """
+        Apply darkness filter to simulate various lighting conditions
+        
+        Args:
+            image: Input image (BGR format)
+            darkness_factor: Brightness multiplier (0.0-1.0)
+            
+        Returns:
+            Darkened image in BGR format
+        """
+        # Convert BGR to RGB for PIL processing
+        pil_image = Image.fromarray(cv2.cvtColor(image, cv2.COLOR_BGR2RGB))
+        
+        # Apply brightness enhancement
+        enhancer = ImageEnhance.Brightness(pil_image)
+        darkened_image = enhancer.enhance(darkness_factor)
+        
+        # Convert back to BGR for OpenCV
+        return cv2.cvtColor(np.array(darkened_image), cv2.COLOR_RGB2BGR)
+
+    # ========
+    # Flipping
+    # ========
+    
+    def flip_image_and_annotations(self, image, annotations):
+        """
+        Flip image and all annotations horizontally
+        
+        Args:
+            image: Input image
+            annotations: List of annotations
+            
+        Returns:
+            Flipped image and updated annotations with flipped coordinates
+        """
+        h, w = image.shape[:2]
+        flipped_image = cv2.flip(image, 1)  # Horizontal flip (1 = flip around y-axis)
+        
+        new_annotations = []
+        for ann in annotations:
+            new_ann = ann.copy()
+            
+            # Flip bounding box (center x coordinate)
+            cx, cy, bw, bh = ann['bbox']
+            cx_flipped = 1 - cx  # Mirror the x-coordinate
+            new_ann['bbox'][0] = cx_flipped
+            
+            # Flip segmentation points (x coordinates only)
+            seg_points = ann['seg_points']
+            flipped_seg_points = []
+            for i in range(0, len(seg_points), 2):
+                x = seg_points[i]
+                y = seg_points[i+1]
+                flipped_seg_points.extend([1 - x, y])  # Flip x, keep y
+            
+            new_ann['seg_points'] = flipped_seg_points
+            new_annotations.append(new_ann)
+        
+        return flipped_image, new_annotations
+
+    # =========
+    # Main loop
+    # =========
+    
+    def augment_single_person_images(self, valid_pairs, augmentation_count=1):
+        """
+        Augmentation loop to process all the images
+        
+        Args:
+            valid_pairs: List of (image_path, annotation_path) tuples
+            augmentation_count: Number of augmented versions to create per image
+            
+        Returns:
+            List of paths to created augmented image-annotation pairs
+        """
+        augmented_pairs = []
+        
+        # Process up to 700 images (adjustable limit)
+        for img_path, ann_path in valid_pairs[:700]:
+            # Load image
+            image = cv2.imread(img_path)
+            if image is None:
+                continue  # Skip if image can't be loaded
+                
+            # Load annotations
+            annotations = self.load_annotations(ann_path)
+            
+            # Only process images with exactly one person
+            person_count = sum(1 for ann in annotations if ann['class_id'] == 0)
+            if person_count != 1:
+                continue
+                
+            base_name = os.path.splitext(os.path.basename(img_path))[0]
+            
+            # Create multiple augmented versions
+            for i in range(augmentation_count):
+                aug_image = image.copy()
+                aug_annotations = annotations.copy()
+                
+                # Apply vertical occlusion
+                aug_image, aug_annotations = self.add_vertical_occlusion(aug_image, aug_annotations)
+                
+                # Apply random darkness for lighting variation
+                darkness = random.uniform(0.85, 1)  # 15% darkness variation
+                aug_image = self.apply_dark_filter(aug_image, darkness)
+                
+                # Apply horizontal flip for additional augmentation
+                aug_image, aug_annotations = self.flip_image_and_annotations(aug_image, aug_annotations)
+                
+                # Save augmented results
+                aug_img_name = f"{base_name}_aug{i}.jpeg"
+                aug_ann_name = f"{base_name}_aug{i}.txt"
+                aug_img_path = os.path.join(self.output_img_dir, aug_img_name)
+                aug_ann_path = os.path.join(self.output_ann_dir, aug_ann_name)
+                
+                cv2.imwrite(aug_img_path, aug_image)
+                self.save_annotations(aug_annotations, aug_ann_path)
+                augmented_pairs.append((aug_img_path, aug_ann_path))
+        
+        return augmented_pairs
+
+
+def main():
+    # Get current script directory
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Define input directories
+    img_dir = os.path.join(base_dir, "img")
+    ann_dir = os.path.join(base_dir, "ann")
+
+    # Define output directories for augmented data
+    output_img_dir = os.path.join(base_dir, "occlusion", "img")
+    output_ann_dir = os.path.join(base_dir, "occlusion", "ann")
+
+    # Find all valid image-annotation pairs
+    valid_pairs = []
+    image_extensions = ["*.png", "*.jpg", "*.jpeg"]
+    image_files = []
+    
+    # Gather all image files with supported extensions
+    for ext in image_extensions:
+        image_files.extend(glob.glob(os.path.join(img_dir, ext)))
+        image_files.extend(glob.glob(os.path.join(img_dir, ext.upper())))  # Case insensitive
+
+    # Verify each image has a corresponding annotation file
+    for image_file in image_files:
+        image_filename = os.path.basename(image_file)
+        label_file = os.path.join(ann_dir, image_filename + ".txt")
+        
+        if os.path.exists(label_file):
+            try:
+                # Check if annotation file is valid (non-empty)
+                with open(label_file, 'r', encoding='utf-8') as f:
+                    lines = f.readlines()
+                valid_lines = [line.strip() for line in lines if line.strip()]
+                if valid_lines:
+                    valid_pairs.append((image_file, label_file))
+            except Exception as e:
+                print(f"Error reading {label_file}: {e}")
+
+    # Initialize augmentor and run augmentation
+    augmentor = PersonOcclusionAugmentor(
+        img_dir=img_dir,
+        ann_dir=ann_dir,
+        output_img_dir=output_img_dir,
+        output_ann_dir=output_ann_dir
+    )
+
+    # Perform augmentation (1 augmented version per image)
+    augmented_pairs = augmentor.augment_single_person_images(valid_pairs, augmentation_count=1)
+    print(f"Created {len(augmented_pairs)} augmented samples")
+
+if __name__ == "__main__":
+    main()

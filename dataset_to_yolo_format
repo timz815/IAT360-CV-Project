@@ -1,0 +1,98 @@
+import os
+import json
+from glob import glob
+
+# convert supervisely dataset to yolo format (json to txt)
+
+
+def convert_supervisely_to_yolo():
+    """
+    Convert Supervisely polygon annotations (segmentation masks) to YOLO format 
+    
+    This function:
+    - Reads JSON annotation files
+    - Converts polygon coordinates to normalized YOLO format
+    - Calculates bounding boxes from polygons
+    - Saves annotations in YOLO format (.txt files)
+    """
+    
+    json_dir = "ann_json"    # path of Supervisely JSON annotation files
+    img_dir = "img"          # path of Supervisely images
+    labels_dir = "ann"       # path for Yolo txt output
+    
+    os.makedirs(labels_dir, exist_ok=True)
+    
+    # map 'person_poly' to class 0 
+    class_map = {"person_poly": 0}
+    
+    # Find all JSON annotation files in the input directory
+    json_files = glob(os.path.join(json_dir, "*.json"))
+    print(f"Found {len(json_files)} JSON files")
+
+    multi_person_count = 0
+    
+    # Process each JSON annotation file
+    for json_file in json_files:
+        with open(json_file) as f:
+            data = json.load(f)
+        
+        img_width = data['size']['width']
+        img_height = data['size']['height']
+        
+        lines = []
+        person_count = 0
+        
+        # Process each object in the annotation
+        for obj in data['objects']:
+            if obj['geometryType'] == "polygon" and 'person' in obj['classTitle'].lower():
+                class_id = class_map.get(obj['classTitle'], 0)
+                
+                # Extract polygon exterior points
+                exterior = obj['points']['exterior']
+                if not exterior:
+                    continue
+                
+                # Convert polygon coordinates
+                polygon_norm = []
+                for x, y in exterior:
+                    # Normalize coordinates by dividing by image dimensions
+                    polygon_norm.append(x / img_width)   # Normalized x coordinate
+                    polygon_norm.append(y / img_height)  # Normalized y coordinate
+                
+                # Calculate bounding box from polygon coordinates
+                x_coords = [p[0] for p in exterior]
+                y_coords = [p[1] for p in exterior]
+                
+                # Find bounding box boundaries
+                x_min, x_max = min(x_coords), max(x_coords)
+                y_min, y_max = min(y_coords), max(y_coords)
+                
+                # Convert bounding box to YOLO format
+                x_center = (x_min + x_max) / 2 / img_width
+                y_center = (y_min + y_max) / 2 / img_height
+                w = (x_max - x_min) / img_width
+                h = (y_max - y_min) / img_height
+                
+                # Format: class_id bbox_x_center bbox_y_center bbox_width bbox_height polygon_x1 ...
+                line = f"{class_id} {x_center:.6f} {y_center:.6f} {w:.6f} {h:.6f} " + " ".join(f"{p:.6f}" for p in polygon_norm)
+                lines.append(line)
+                person_count += 1
+        
+        if person_count > 1:
+            multi_person_count += 1
+            print(f"{os.path.basename(json_file)}: {person_count} people")
+        else:
+            print(f"{os.path.basename(json_file)}: {person_count} person")
+        
+        # Save YOLO format annotation to .txt file
+        base_name = os.path.splitext(os.path.basename(json_file))[0]  # Remove .json extension
+        txt_path = os.path.join(labels_dir, base_name + ".txt")       # Output file path
+        
+        with open(txt_path, "w") as f:
+            f.write("\n".join(lines))
+    
+    print(f"Total files: {len(json_files)}")
+    print(f"Multi-person images: {multi_person_count}")
+
+if __name__ == "__main__":
+    convert_supervisely_to_yolo()

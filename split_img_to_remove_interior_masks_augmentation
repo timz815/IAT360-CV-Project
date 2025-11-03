@@ -1,0 +1,500 @@
+import os
+import json
+import cv2
+import numpy as np
+from glob import glob
+import shutil
+
+"""
+This script splits images of people with interior holes in their segmentation masks into smaller crops so they no longer have interior holes (YOLO can't process interior holes)
+"""
+
+# Math stuff
+def polygon_area(points):
+    """Calculate polygon area using shoelace formula"""
+    if not points or len(points) < 3:
+        return 0
+    x = [p[0] for p in points]
+    y = [p[1] for p in points]
+    return 0.3 * abs(sum(x[i]*y[(i+1)%len(points)] - x[(i+1)%len(points)]*y[i] for i in range(len(points))))
+
+def remove_duplicate_points(points):
+    """Remove duplicate consecutive points"""
+    if not points:
+        return []
+    cleaned = [points[0]]
+    for i in range(1, len(points)):
+        if points[i] != cleaned[-1]:
+            cleaned.append(points[i])
+    if len(cleaned) > 1 and cleaned[-1] == cleaned[0]:
+        cleaned.pop()
+    return cleaned
+
+def calculate_polygon_bbox(points, crop_width, crop_height):
+    """Calculate YOLO bbox for polygon relative to cropped image"""
+    if not points or len(points) < 3:
+        return 0, 0, 0, 0
+    x_coords = [p[0] for p in points]
+    y_coords = [p[1] for p in points]
+    x_min, x_max = max(0, min(x_coords)), min(crop_width, max(x_coords))
+    y_min, y_max = max(0, min(y_coords)), min(crop_height, max(y_coords))
+    x_center = (x_min + x_max) / 2 / crop_width
+    y_center = (y_min + y_max) / 2 / crop_height
+    w = (x_max - x_min) / crop_width
+    h = (y_max - y_min) / crop_height
+    return x_center, y_center, w, h
+
+def safe_crop_image(image, x_start, x_end, y_start, y_end):
+    """Crop image safely with bounds check"""
+    h, w = image.shape[:2]
+    x_start = max(0, x_start)
+    x_end = min(w, x_end)
+    y_start = max(0, y_start)
+    y_end = min(h, y_end)
+    
+    if x_end <= x_start or y_end <= y_start:
+        return None
+    return image[y_start:y_end, x_start:x_end]
+
+def shift_polygon(polygon, x_shift, y_shift):
+    # Shift polygon coordinates
+    return [[x - x_shift, y - y_shift] for x, y in polygon]
+
+def filter_polygon_in_crop(polygon, crop_width, crop_height):
+    # Filter polygon to keep only points within crop bounds
+    return [[x, y] for x, y in polygon if 0 <= x <= crop_width and 0 <= y <= crop_height]
+
+def calculate_segmentation_bbox(exterior, interiors, crop_width, crop_height):
+    #Calculate bounding box that has both exterior and interiors
+    all_points = exterior.copy()
+    for interior in interiors:
+        all_points.extend(interior)
+    
+    if not all_points or len(all_points) < 3:
+        return 0, 0, 0, 0
+        
+    x_coords = [p[0] for p in all_points]
+    y_coords = [p[1] for p in all_points]
+    x_min, x_max = max(0, min(x_coords)), min(crop_width, max(x_coords))
+    y_min, y_max = max(0, min(y_coords)), min(crop_height, max(y_coords))
+    x_center = (x_min + x_max) / 2 / crop_width
+    y_center = (y_min + y_max) / 2 / crop_height
+    w = (x_max - x_min) / crop_width
+    h = (y_max - y_min) / crop_height
+    return x_center, y_center, w, h
+
+# Functions
+def merge_polygons_with_interiors(exterior, interiors, crop_width, crop_height):
+    """
+    Combine exterior and interiors into one polygon
+    The format is: exterior points followed by interior points    
+    """
+    
+    # Filter points to be within crop bounds
+    exterior_filtered = filter_polygon_in_crop(exterior, crop_width, crop_height)
+    interiors_filtered = [filter_polygon_in_crop(interior, crop_width, crop_height) for interior in interiors]
+    
+    # Only include interiors that have at least 3 points after filtering
+    valid_interiors = [interior for interior in interiors_filtered if len(interior) >= 3]
+    
+    # If no valid interiors, just return the exterior
+    if not valid_interiors:
+        return exterior_filtered, []
+
+    return exterior_filtered, valid_interiors
+
+# =================================================
+# ---------------- Splitting Logic ----------------
+# =================================================
+
+def create_polygon_mask(exterior, interiors, img_width, img_height):
+    #Create a binary mask from polygon with holes
+    mask = np.zeros((img_height, img_width), dtype=np.uint8)
+    
+    # Draw exterior as white
+    exterior_np = np.array(exterior, dtype=np.int32)
+    cv2.fillPoly(mask, [exterior_np], 1)
+    
+    # Draw interiors as black (holes)
+    for interior in interiors:
+        if len(interior) >= 3:
+            interior_np = np.array(interior, dtype=np.int32)
+            cv2.fillPoly(mask, [interior_np], 0)
+    
+    return mask
+
+def split_mask_vertically(mask, split_x):
+    #Split mask vertically and extract polygons from each side
+    height, width = mask.shape
+    
+    # Convert split_x to integer for array slicing
+    split_x_int = int(split_x)
+    
+    # Create masks for left and right sides
+    left_mask = mask[:, :split_x_int]
+    right_mask = mask[:, split_x_int:]
+    
+    # Extract polygons from left mask
+    left_contours, _ = cv2.findContours(left_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    left_polygons = []
+    for contour in left_contours:
+        if len(contour) >= 3:
+            polygon = contour.reshape(-1, 2).tolist()
+            left_polygons.append(polygon)
+    
+    # Extract polygons from right mask
+    right_contours, _ = cv2.findContours(right_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    right_polygons = []
+    for contour in right_contours:
+        if len(contour) >= 3:
+            polygon = contour.reshape(-1, 2).tolist()
+            # Adjust x coordinates for right side
+            adjusted_polygon = [[x + split_x_int, y] for x, y in polygon]
+            right_polygons.append(adjusted_polygon)
+    
+    # Return the largest polygon from each side
+    left_poly = max(left_polygons, key=lambda p: polygon_area(p)) if left_polygons else None
+    right_poly = max(right_polygons, key=lambda p: polygon_area(p)) if right_polygons else None
+    
+    return left_poly, right_poly
+
+def split_mask_horizontally(mask, split_y):
+    #Split mask horizontally and extract polygons from each side
+    height, width = mask.shape
+    
+    # Convert split_y to integer for array slicing
+    split_y_int = int(split_y)
+    
+    # Create masks for top and bottom sides
+    top_mask = mask[:split_y_int, :]
+    bottom_mask = mask[split_y_int:, :]
+    
+    # Extract polygons from top mask
+    top_contours, _ = cv2.findContours(top_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    top_polygons = []
+    for contour in top_contours:
+        if len(contour) >= 3:
+            polygon = contour.reshape(-1, 2).tolist()
+            top_polygons.append(polygon)
+    
+    # Extract polygons from bottom mask
+    bottom_contours, _ = cv2.findContours(bottom_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    bottom_polygons = []
+    for contour in bottom_contours:
+        if len(contour) >= 3:
+            polygon = contour.reshape(-1, 2).tolist()
+            # Adjust y coordinates for bottom side
+            adjusted_polygon = [[x, y + split_y_int] for x, y in polygon]
+            bottom_polygons.append(adjusted_polygon)
+    
+    # Return the largest polygon from each side
+    top_poly = max(top_polygons, key=lambda p: polygon_area(p)) if top_polygons else None
+    bottom_poly = max(bottom_polygons, key=lambda p: polygon_area(p)) if bottom_polygons else None
+    
+    return top_poly, bottom_poly
+
+def find_optimal_split_line(exterior, interiors, img_width, img_height, strategy):
+    # Find optimal split line based on interior hole positions
+    if strategy == "vertical_split":
+        centers = [(min(p[0] for p in interior) + max(p[0] for p in interior))/2 for interior in interiors if interior and len(interior) >= 2]
+        if centers:
+            split_line = max(0, min(img_width, sorted(centers)[len(centers)//2]))
+        else:
+            split_line = img_width // 2
+    else:
+        centers = [(min(p[1] for p in interior) + max(p[1] for p in interior))/2 for interior in interiors if interior and len(interior) >= 2]
+        if centers:
+            split_line = max(0, min(img_height, sorted(centers)[len(centers)//2]))
+        else:
+            split_line = img_height // 2
+    
+    # Ensure split_line is within bounds
+    if strategy == "vertical_split":
+        split_line = max(1, min(img_width - 1, split_line))
+    else:
+        split_line = max(1, min(img_height - 1, split_line))
+    
+    return split_line
+
+def should_split_interior(exterior, interiors):
+    #Decide whether to split vertically or horizontally based on hole aspect ratios
+    if not interiors:
+        return False, None
+    
+    hole_ratios = []
+    for interior in interiors:
+        if not interior or len(interior) < 3:
+            continue
+        w = max(p[0] for p in interior) - min(p[0] for p in interior)
+        h = max(p[1] for p in interior) - min(p[1] for p in interior)
+        if h > 0:
+            hole_ratios.append(w/h)
+    
+    if not hole_ratios:
+        return False, None
+    
+    # Use aspect ratio to determine split direction
+    avg_ratio = sum(hole_ratios)/len(hole_ratios)
+    return True, "horizontal_split" if avg_ratio < 0.8 else "vertical_split"
+
+# ====================================================
+# ---------------- Skip smaller holes ----------------
+# ====================================================
+
+def process_pass_folder(image, data, base_name, pass_img_dir, pass_ann_dir):
+    #Process images that don't meet the splitting criteria into the pass folder
+    class_map = {"person_poly": 0}
+    img_width, img_height = data['size']['width'], data['size']['height']
+    
+    # Save original image to pass folder
+    img_name = base_name + ".jpg"
+    cv2.imwrite(os.path.join(pass_img_dir, img_name), image)
+    
+    # Create YOLO annotations for all person objects
+    yolo_lines = []
+    for obj in data['objects']:
+        if obj['geometryType'] != "polygon" or 'person' not in obj['classTitle'].lower():
+            continue
+        
+        exterior = obj['points']['exterior']
+        interiors = obj['points'].get('interior', [])
+        
+        if not exterior or len(exterior) < 3:
+            continue
+        
+        class_id = class_map.get("person_poly", 0)
+        
+        # Merge exterior and interiors for proper segmentation
+        exterior_filtered, valid_interiors = merge_polygons_with_interiors(
+            exterior, interiors, img_width, img_height
+        )
+        
+        if not exterior_filtered or len(exterior_filtered) < 3:
+            continue
+        
+        # Calculate normalized polygon coordinates for exterior
+        polygon_norm = []
+        for x, y in exterior_filtered:
+            x_norm = x / img_width
+            y_norm = y / img_height
+            x_norm = max(0, min(1, x_norm))
+            y_norm = max(0, min(1, y_norm))
+            polygon_norm.extend([x_norm, y_norm])
+        
+        # Add interiors to the polygon
+        for interior in valid_interiors:
+            for x, y in interior:
+                x_norm = x / img_width
+                y_norm = y / img_height
+                x_norm = max(0, min(1, x_norm))
+                y_norm = max(0, min(1, y_norm))
+                polygon_norm.extend([x_norm, y_norm])
+        
+        # Calculate bounding box that includes both exterior and interiors
+        x_c, y_c, w, h = calculate_segmentation_bbox(exterior_filtered, valid_interiors, img_width, img_height)
+        
+        # Create YOLO line
+        line = f"{class_id} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f} " + " ".join(f"{p:.6f}" for p in polygon_norm)
+        yolo_lines.append(line)
+    
+    # Write YOLO format file
+    if yolo_lines:
+        txt_name = base_name + ".txt"
+        with open(os.path.join(pass_ann_dir, txt_name), "w") as f:
+            f.write("\n".join(yolo_lines) + "\n")
+    
+    return len(yolo_lines) > 0
+
+# ===========================================
+# ---------------- Main Loop ----------------
+# ===========================================
+
+def process_images_with_interiors():
+    # Directory setup for split images (with interiors) and pass images (without interiors)
+    split_dir = "split"
+    split_img_dir = os.path.join(split_dir, "img")
+    split_ann_dir = os.path.join(split_dir, "ann")
+    
+    pass_dir = "pass"
+    pass_img_dir = os.path.join(pass_dir, "img")
+    pass_ann_dir = os.path.join(pass_dir, "ann")
+    
+    # Create all directories
+    os.makedirs(split_img_dir, exist_ok=True)
+    os.makedirs(split_ann_dir, exist_ok=True)
+    os.makedirs(pass_img_dir, exist_ok=True)
+    os.makedirs(pass_ann_dir, exist_ok=True)
+
+    json_dir = "ann_json"
+    img_dir = "img"
+    class_map = {"person_poly": 0}
+
+    json_files = glob(os.path.join(json_dir, "*.json"))
+    print(f"Found {len(json_files)} JSON files")
+
+    processed_count, error_count = 0, 0
+    discarded_small_crops = 0
+    total_crops_created = 0
+    total_pass_files = 0
+
+    for json_file in json_files:
+        try:
+            with open(json_file) as f:
+                data = json.load(f)
+            img_width, img_height = data['size']['width'], data['size']['height']
+
+            base_name = os.path.basename(json_file).replace(".json","").replace(".jpg","").replace(".png","").replace(".jpeg","")
+            img_path = next((os.path.join(img_dir, base_name + ext) for ext in [".jpg",".png",".jpeg"] if os.path.exists(os.path.join(img_dir, base_name + ext))), None)
+            if not img_path:
+                print(f"Image not found for {base_name}")
+                continue
+
+            image = cv2.imread(img_path)
+            if image is None:
+                print(f"Could not load {img_path}")
+                continue
+
+            # Collect all valid person objects and check if any have significant interiors
+            person_objects = []
+            has_significant_interiors = False
+            
+            for obj in data['objects']:
+                if obj['geometryType'] != "polygon" or 'person' not in obj['classTitle'].lower():
+                    continue
+                
+                exterior = obj['points']['exterior']
+                interiors = obj['points'].get('interior', [])
+                
+                # Filter small interiors and check if any are significant
+                ext_area = polygon_area(exterior)
+                significant_interiors = []
+                for interior in interiors:
+                    if len(interior) >= 3 and ext_area > 0:
+                        interior_ratio = polygon_area(interior) / ext_area
+                        if interior_ratio >= 0.01:  # Only consider interiors that are at least 1% of exterior area
+                            significant_interiors.append(interior)
+                            has_significant_interiors = True
+                
+                if exterior and len(exterior) >= 3:
+                    person_objects.append({
+                        'exterior': exterior,
+                        'interiors': significant_interiors
+                    })
+
+            # If no significant interiors, process in pass folder
+            if not has_significant_interiors:
+                if process_pass_folder(image, data, base_name, pass_img_dir, pass_ann_dir):
+                    total_pass_files += 1
+                processed_count += 1
+                continue
+
+            # Process each person object with significant interiors
+            for i, person in enumerate(person_objects):
+                exterior = person['exterior']
+                interiors = person['interiors']
+
+                if not interiors:
+                    continue
+
+                should_split, strategy = should_split_interior(exterior, interiors)
+                if not should_split:
+                    continue
+
+                split_line = find_optimal_split_line(exterior, interiors, img_width, img_height, strategy)
+
+                # Create mask from polygon with holes
+                mask = create_polygon_mask(exterior, interiors, img_width, img_height)
+                
+                # Split using mask-based approach
+                if strategy == "vertical_split":
+                    left_poly, right_poly = split_mask_vertically(mask, split_line)
+                    
+                    crops = []
+                    if left_poly and len(left_poly) >= 3:
+                        crops.append(("_left", left_poly, 0, int(split_line), 0, img_height))
+                    if right_poly and len(right_poly) >= 3:
+                        crops.append(("_right", right_poly, int(split_line), img_width, 0, img_height))
+                else:
+                    top_poly, bottom_poly = split_mask_horizontally(mask, split_line)
+                    
+                    crops = []
+                    if top_poly and len(top_poly) >= 3:
+                        crops.append(("_top", top_poly, 0, img_width, 0, int(split_line)))
+                    if bottom_poly and len(bottom_poly) >= 3:
+                        crops.append(("_bottom", bottom_poly, 0, img_width, int(split_line), img_height))
+
+                # Process each crop
+                for suffix, split_poly, x_start, x_end, y_start, y_end in crops:
+                    crop_width = x_end - x_start
+                    crop_height = y_end - y_start
+                    
+                    # FINAL CHECK: Discard if width or height is less than 500
+                    if crop_width < 500 or crop_height < 500:
+                        discarded_small_crops += 1
+                        continue
+                    
+                    cropped_img = safe_crop_image(image, x_start, x_end, y_start, y_end)
+                    if cropped_img is None:
+                        continue
+
+                    # Shift and filter the split polygon to crop coordinates
+                    split_poly_shifted = shift_polygon(split_poly, x_start, y_start)
+                    split_poly_filtered = filter_polygon_in_crop(split_poly_shifted, crop_width, crop_height)
+                    
+                    if len(split_poly_filtered) < 3:
+                        continue
+
+                    # Create unique identifier for this object crop
+                    obj_suffix = f"_{i}{suffix}" if len(person_objects) > 1 else suffix
+                    img_name = base_name + obj_suffix + ".jpg"
+                    
+                    # Save image
+                    cv2.imwrite(os.path.join(split_img_dir, img_name), cropped_img)
+
+                    # Prepare YOLO annotation
+                    class_id = class_map.get("person_poly", 0)
+                    
+                    # We're using the contour from the mask which already accounts for holes
+                    exterior_final = split_poly_filtered
+                    
+                    # Calculate normalized polygon coordinates
+                    polygon_norm = []
+                    for x, y in exterior_final:
+                        x_norm = x / crop_width
+                        y_norm = y / crop_height
+                        x_norm = max(0, min(1, x_norm))
+                        y_norm = max(0, min(1, y_norm))
+                        polygon_norm.extend([x_norm, y_norm])
+                    
+                    # Calculate bounding box
+                    x_c, y_c, w, h = calculate_polygon_bbox(exterior_final, crop_width, crop_height)
+                    
+                    # Write YOLO format
+                    line = f"{class_id} {x_c:.6f} {y_c:.6f} {w:.6f} {h:.6f} " + " ".join(f"{p:.6f}" for p in polygon_norm)
+                    txt_name = base_name + obj_suffix + ".txt"
+                    with open(os.path.join(split_ann_dir, txt_name), "w") as f:
+                        f.write(line + "\n")
+                    
+                    total_crops_created += 1
+
+            processed_count += 1
+            if processed_count % 100 == 0:
+                print(f"Processed {processed_count} files...")
+
+        except Exception as e:
+            print(f"Error processing {json_file}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            error_count += 1
+
+    print(f"\n=== Processing Summary ===")
+    print(f"Total JSON files processed: {processed_count}")
+    print(f"Errors encountered: {error_count}")
+    print(f"Total crops created in 'split' folder: {total_crops_created}")
+    print(f"Total files copied to 'pass' folder: {total_pass_files}")
+    print(f"Crops discarded (width/height < 500): {discarded_small_crops}")
+    print(f"Final image count in 'split' folder: {total_crops_created}")
+    print(f"Final image count in 'pass' folder: {total_pass_files}")
+
+if __name__ == "__main__":
+    process_images_with_interiors()
